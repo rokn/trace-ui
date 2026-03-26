@@ -213,7 +213,7 @@ func (a *App) build() {
 				go a.loadTraces() // goroutine — SetDoneFunc runs on the event loop
 			}
 			a.pages.HidePage("search")
-			a.tviewApp.SetFocus(a.traceTable)
+			a.setFocusTo(a.traceTable)
 		})
 
 	// ── layout ────────────────────────────────────────────────────────────────
@@ -576,11 +576,10 @@ func (a *App) renderTraceTableHeader() {
 }
 
 func (a *App) renderTraceTable() {
-	// clear data rows
-	rc := a.traceTable.GetRowCount()
-	for r := 1; r < rc; r++ {
-		a.traceTable.RemoveRow(1)
-	}
+	// Clear and re-add header — RemoveRow decrements selectedRow on each call
+	// which can make it go negative and corrupt tview's internal table state.
+	a.traceTable.Clear()
+	a.renderTraceTableHeader()
 
 	a.mu.Lock()
 	traces := a.traces
