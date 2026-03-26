@@ -52,7 +52,11 @@ type App struct {
 	selectedTrace *jaeger.Trace
 	selectedSpan  *jaeger.Span
 	flatSpans     []*jaeger.SpanNode
+	collapsed     map[string]bool
+	treeOffset    int // how many indent levels are scrolled off the left edge
+	labelW        int // cached label column width from last render, used for offset calc
 	serviceColMap map[string]tcell.Color
+	showBar       bool
 
 	// search params
 	searchService   string
@@ -82,10 +86,12 @@ type App struct {
 
 func NewApp(client *jaeger.Client) *App {
 	a := &App{
-		client:        client,
-		searchLimit:   20,
+		client:         client,
+		searchLimit:    20,
 		searchLookback: "1h",
-		serviceColMap: map[string]tcell.Color{},
+		serviceColMap:  map[string]tcell.Color{},
+		collapsed:      map[string]bool{},
+		showBar:        false,
 	}
 	a.build()
 	return a
@@ -153,7 +159,7 @@ func (a *App) build() {
 		SetDynamicColors(true).
 		SetScrollable(true).
 		SetWrap(false)
-	a.styleBox(a.waterfallView.Box, "Waterfall  [::d](↑/↓=span, Tab=panel)[white]")
+	a.styleBox(a.waterfallView.Box, "Waterfall  [::d](j/k=span  Space=collapse  h=bar)[white]")
 	a.waterfallView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyUp:
@@ -162,14 +168,22 @@ func (a *App) build() {
 		case tcell.KeyDown:
 			a.selectSpanDeltaInLoop(1)
 			return nil
-		}
-		switch event.Rune() {
-		case 'j':
-			a.selectSpanDeltaInLoop(1)
-			return nil
-		case 'k':
-			a.selectSpanDeltaInLoop(-1)
-			return nil
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'j':
+				a.selectSpanDeltaInLoop(1)
+				return nil
+			case 'k':
+				a.selectSpanDeltaInLoop(-1)
+				return nil
+			case ' ':
+				a.toggleCollapseInLoop()
+				return nil
+			case 'h':
+				a.showBar = !a.showBar
+				a.renderWaterfall()
+				return nil
+			}
 		}
 		return event
 	})
@@ -196,7 +210,7 @@ func (a *App) build() {
 				a.mu.Lock()
 				a.searchTags = a.searchBar.GetText()
 				a.mu.Unlock()
-				a.loadTraces()
+				go a.loadTraces() // goroutine — SetDoneFunc runs on the event loop
 			}
 			a.pages.HidePage("search")
 			a.tviewApp.SetFocus(a.traceTable)
@@ -204,22 +218,20 @@ func (a *App) build() {
 
 	// ── layout ────────────────────────────────────────────────────────────────
 
-	leftPanel := tview.NewFlex().SetDirection(tview.FlexRow).
+	// Top bar: services + operations side by side.
+	topBar := tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(a.serviceList, 0, 1, true).
 		AddItem(a.operationList, 0, 1, false)
 
-	rightTop := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(a.traceTable, 0, 1, false)
-
+	// Bottom: waterfall + span detail side by side.
 	detailPanel := tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(a.waterfallView, 0, 3, false).
 		AddItem(a.spanDetailView, 0, 2, false)
 
-	mainFlex := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(leftPanel, 28, 0, true).
-		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-			AddItem(rightTop, 0, 1, false).
-			AddItem(detailPanel, 0, 1, false), 0, 1, false)
+	mainFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(topBar, 8, 0, true).
+		AddItem(a.traceTable, 0, 1, false).
+		AddItem(detailPanel, 0, 2, false)
 
 	a.layout = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(mainFlex, 0, 1, true).
@@ -626,8 +638,9 @@ func (a *App) openTrace(t *jaeger.Trace) {
 		a.mu.Lock()
 		a.selectedTrace = full
 		a.selectedSpan = nil
-		tree := full.SpanTree()
-		a.flatSpans = jaeger.FlattenTree(tree, 0)
+		a.collapsed = map[string]bool{}
+		a.treeOffset = 0
+		a.flatSpans = a.buildFlatSpans(full)
 		a.mu.Unlock()
 		a.tviewApp.QueueUpdateDraw(func() {
 			a.renderWaterfall()
@@ -660,6 +673,14 @@ func (a *App) renderWaterfall() {
 		return
 	}
 
+	// Build a set of spanIDs that have children (used for collapse indicator).
+	hasChildren := map[string]bool{}
+	for _, n := range flat {
+		if len(n.Children) > 0 {
+			hasChildren[n.Span.SpanID] = true
+		}
+	}
+
 	// Determine time range across all spans.
 	var minStart, maxEnd int64
 	for i, s := range t.Spans {
@@ -676,88 +697,165 @@ func (a *App) renderWaterfall() {
 		totalDur = 1
 	}
 
-	// Use actual panel width so the bar is always visible regardless of split layout.
+	// Use actual panel width so the bar fits regardless of split layout.
 	_, _, panelW, _ := a.waterfallView.GetInnerRect()
 	if panelW < 40 {
-		panelW = 80 // fallback before first draw
+		panelW = 80
 	}
 
-	// Fixed columns: label=32, sep=1, svc=10, sep=1, dur=7, sep=1 → bar gets the rest.
-	const labelW = 32
 	const svcW = 10
 	const durW = 7
-	const fixedCols = labelW + 1 + svcW + 1 + durW + 1
-	barWidth := panelW - fixedCols
-	if barWidth < 8 {
-		barWidth = 8
+
+	// When bar is hidden: label takes all remaining space minus service/dur columns.
+	// When bar is visible: label=32 fixed, bar takes the rest.
+	var labelW, barWidth int
+	if a.showBar {
+		labelW = 32
+		barWidth = panelW - labelW - 1 - svcW - 1 - durW - 1
+		if barWidth < 8 {
+			barWidth = 8
+		}
+	} else {
+		labelW = panelW - 1 - svcW - 1 - durW - 1
+		if labelW < 20 {
+			labelW = 20
+		}
+		barWidth = 0
 	}
+	a.labelW = labelW // cache for offset calculations in input handlers
 
 	var sb strings.Builder
-	// Header
-	hdrLabel := runeLimit("Span", labelW)
-	sb.WriteString(fmt.Sprintf("[::b]%-*s %-*s %-*s %s\n[-:-:-]",
-		labelW, hdrLabel,
-		svcW, "Service",
-		barWidth, strings.Repeat("─", barWidth),
-		"Dur",
-	))
 
-	for _, node := range flat {
+	// Header
+	if a.showBar {
+		sb.WriteString(fmt.Sprintf("[::b]%-*s %-*s %-*s %s[-:-:-]\n",
+			labelW, "Span",
+			svcW, "Service",
+			barWidth, strings.Repeat("─", barWidth),
+			"Dur",
+		))
+	} else {
+		sb.WriteString(fmt.Sprintf("[::b]%-*s %-*s %s[-:-:-]\n",
+			labelW, "Span",
+			svcW, "Service",
+			"Dur",
+		))
+	}
+
+	selectedRow := -1
+
+	for rowIdx, node := range flat {
 		s := node.Span
 		svcName := s.ServiceName(t.Processes)
 		colHex := colorToHex(a.serviceColor(svcName))
-
-		// Label: 1 space per indent level to leave more room for deep traces.
-		indent := strings.Repeat(" ", node.Depth)
-		rawLabel := indent + "▸ " + s.OperationName
-		opLabel := runeLimit(rawLabel, labelW)
-
-		// Bar math — all clamped to avoid negative repeat counts.
-		spanStartFrac := float64(s.StartTime-minStart) / float64(totalDur)
-		spanWidthFrac := float64(s.Duration) / float64(totalDur)
-		leftPad := clamp(int(spanStartFrac*float64(barWidth)), 0, barWidth-1)
-		barLen := int(spanWidthFrac * float64(barWidth))
-		if barLen < 1 {
-			barLen = 1
-		}
-		if leftPad+barLen > barWidth {
-			barLen = barWidth - leftPad
-		}
-		rightPad := barWidth - leftPad - barLen // always >= 0 now
-
-		bar := strings.Repeat(" ", leftPad) +
-			"[" + colHex + "]" + strings.Repeat("█", barLen) + "[white]" +
-			strings.Repeat(" ", rightPad)
-
 		isSelected := selected != nil && selected.SpanID == s.SpanID
+		hasErr := spanHasError(s)
+
+		// Collapse/expand indicator.
+		var arrowRune string
+		if hasChildren[s.SpanID] {
+			if a.collapsed[s.SpanID] {
+				arrowRune = "▶"
+			} else {
+				arrowRune = "▾"
+			}
+		} else {
+			arrowRune = " "
+		}
+
+		// Apply tree offset: shift all depths left by treeOffset.
+		// Spans shallower than the offset are clamped to depth 0 and get a
+		// "‹" prefix to signal they're scrolled past.
+		effectiveDepth := node.Depth - a.treeOffset
+		var scrolledPast bool
+		if effectiveDepth < 0 {
+			effectiveDepth = 0
+			scrolledPast = true
+		}
+
+		indent := strings.Repeat(" ", effectiveDepth)
+		prefix := arrowRune
+		if scrolledPast {
+			prefix = "‹" // ancestor that's been panned past
+		}
+
+		rawLabel := indent + prefix + " " + s.OperationName
+		labelPlain := runeLimit(rawLabel, labelW)
+
+		// Only the arrow/prefix character is service-colored; name stays white.
+		arrowColor := colHex
+		if hasErr {
+			arrowColor = "red"
+		}
+		labelRunes := []rune(labelPlain)
+		// The colored char is the arrow, which sits at effectiveDepth position.
+		arrowPos := effectiveDepth
+		if arrowPos >= len(labelRunes) {
+			arrowPos = len(labelRunes) - 1
+		}
+		before := string(labelRunes[:arrowPos])
+		arrowCh := string(labelRunes[arrowPos : arrowPos+1])
+		after := string(labelRunes[arrowPos+1:])
+		coloredLabel := fmt.Sprintf("%s[%s]%s[white]%s", before, arrowColor, arrowCh, after)
 
 		if isSelected {
-			sb.WriteString(fmt.Sprintf("[::r]%-*s [%s]%-*s[white] %s [yellow]%-*s[-:-:-]\n",
-				labelW, opLabel,
-				colHex, svcW, truncate(svcName, svcW),
-				bar,
-				durW, s.DurationString(),
-			))
+			selectedRow = rowIdx + 1
+		}
+
+		durStr := runePad(s.DurationString(), durW)
+
+		if a.showBar {
+			spanStartFrac := float64(s.StartTime-minStart) / float64(totalDur)
+			spanWidthFrac := float64(s.Duration) / float64(totalDur)
+			leftPad := clamp(int(spanStartFrac*float64(barWidth)), 0, barWidth-1)
+			barLen := int(spanWidthFrac * float64(barWidth))
+			if barLen < 1 {
+				barLen = 1
+			}
+			if leftPad+barLen > barWidth {
+				barLen = barWidth - leftPad
+			}
+			rightPad := barWidth - leftPad - barLen
+
+			barStr := strings.Repeat(" ", leftPad) +
+				"[" + colHex + "]" + strings.Repeat("█", barLen) + "[white]" +
+				strings.Repeat(" ", rightPad)
+
+			if isSelected {
+				fmt.Fprintf(&sb, "[::r]%s [%s]%-*s[white] %s [yellow]%s[-:-:-]\n",
+					coloredLabel,
+					colHex, svcW, truncate(svcName, svcW),
+					barStr, durStr,
+				)
+			} else {
+				fmt.Fprintf(&sb, "%s[white] [%s]%-*s[white] %s %s[-:-:-]\n",
+					coloredLabel,
+					colHex, svcW, truncate(svcName, svcW),
+					barStr, durStr,
+				)
+			}
 		} else {
-			sb.WriteString(fmt.Sprintf("%-*s [%s]%-*s[white] %s [::d]%-*s[white]\n",
-				labelW, opLabel,
-				colHex, svcW, truncate(svcName, svcW),
-				bar,
-				durW, s.DurationString(),
-			))
+			if isSelected {
+				fmt.Fprintf(&sb, "[::r]%s [%s]%-*s[white] [yellow]%s[-:-:-]\n",
+					coloredLabel,
+					colHex, svcW, truncate(svcName, svcW),
+					durStr,
+				)
+			} else {
+				fmt.Fprintf(&sb, "%s[white] [%s]%-*s[white] %s[-:-:-]\n",
+					coloredLabel,
+					colHex, svcW, truncate(svcName, svcW),
+					durStr,
+				)
+			}
 		}
 	}
 
 	a.waterfallView.SetText(sb.String())
 
-	// Scroll selected span into view.
-	if selected != nil {
-		for i, n := range flat {
-			if n.Span.SpanID == selected.SpanID {
-				a.waterfallView.ScrollTo(i+1, 0) // +1 for header row
-				break
-			}
-		}
+	// Scroll vertically to keep selected span visible.
+	if selectedRow >= 0 {
+		a.waterfallView.ScrollTo(selectedRow, 0)
 	}
 }
 
@@ -860,10 +958,55 @@ func (a *App) selectSpanDeltaInLoop(delta int) {
 	idx = clamp(idx+delta, 0, len(flat)-1)
 	a.mu.Lock()
 	a.selectedSpan = flat[idx].Span
+	nameLen := len([]rune(flat[idx].Span.OperationName))
+	a.treeOffset = computeTreeOffset(flat[idx].Depth, nameLen, a.labelW)
 	a.mu.Unlock()
 	// Already on the event loop — render directly, tview will redraw after the handler returns.
 	a.renderWaterfall()
 	a.renderSpanDetail()
+}
+
+// toggleCollapseInLoop toggles collapse state of the selected span and rebuilds
+// the flat list. Called from SetInputCapture (event loop) — must not use QueueUpdateDraw.
+func (a *App) toggleCollapseInLoop() {
+	a.mu.Lock()
+	if a.selectedTrace == nil || a.selectedSpan == nil {
+		a.mu.Unlock()
+		return
+	}
+	id := a.selectedSpan.SpanID
+	a.collapsed[id] = !a.collapsed[id]
+	a.flatSpans = a.buildFlatSpans(a.selectedTrace)
+	// Re-find selected span depth after rebuild to keep offset consistent.
+	for _, n := range a.flatSpans {
+		if n.Span.SpanID == id {
+			nameLen := len([]rune(n.Span.OperationName))
+			a.treeOffset = computeTreeOffset(n.Depth, nameLen, a.labelW)
+			break
+		}
+	}
+	a.mu.Unlock()
+	a.renderWaterfall()
+	a.renderSpanDetail()
+}
+
+// buildFlatSpans produces a flat ordered list of span nodes, skipping children
+// of collapsed spans.
+func (a *App) buildFlatSpans(t *jaeger.Trace) []*jaeger.SpanNode {
+	tree := t.SpanTree()
+	return a.flattenCollapsed(tree, 0)
+}
+
+func (a *App) flattenCollapsed(nodes []*jaeger.SpanNode, depth int) []*jaeger.SpanNode {
+	var result []*jaeger.SpanNode
+	for _, n := range nodes {
+		n.Depth = depth
+		result = append(result, n)
+		if !a.collapsed[n.Span.SpanID] {
+			result = append(result, a.flattenCollapsed(n.Children, depth+1)...)
+		}
+	}
+	return result
 }
 
 // ── utils ─────────────────────────────────────────────────────────────────────
@@ -876,13 +1019,21 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// runeLimit truncates s to at most n visible runes, padding with spaces to exactly n.
+// runeLimit truncates s to at most n visible runes and pads to exactly n.
 func runeLimit(s string, n int) string {
 	r := []rune(s)
 	if len(r) > n {
 		r = append(r[:n-1], '…')
 	}
-	// Pad to fixed width so %-*s columns align correctly.
+	for len(r) < n {
+		r = append(r, ' ')
+	}
+	return string(r)
+}
+
+// runePad pads s with spaces to at least n runes without truncating.
+func runePad(s string, n int) string {
+	r := []rune(s)
 	for len(r) < n {
 		r = append(r, ' ')
 	}
@@ -919,6 +1070,28 @@ func listVimKeys(l *tview.List) func(*tcell.EventKey) *tcell.EventKey {
 		}
 		return event
 	}
+}
+
+// computeTreeOffset returns the minimum indent offset needed so that the span
+// at the given depth with the given operation name is fully visible within
+// labelW columns. Returns 0 if no shift is needed.
+// arrow(1) + space(1) + name = depth+2+nameLen total runes needed.
+func computeTreeOffset(depth, nameRuneLen, labelW int) int {
+	needed := depth + 2 + nameRuneLen - labelW
+	if needed <= 0 {
+		return 0
+	}
+	return needed
+}
+
+func spanHasError(s *jaeger.Span) bool {
+	for _, tag := range s.Tags {
+		if tag.Key == "error" {
+			v := fmt.Sprintf("%v", tag.Value)
+			return v == "true" || v == "1"
+		}
+	}
+	return false
 }
 
 func colorToHex(c tcell.Color) string {
